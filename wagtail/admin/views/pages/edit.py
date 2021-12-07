@@ -134,23 +134,49 @@ class EditView(TemplateResponseMixin, ContextMixin, HookResponseMixin, View):
             return
 
         # Get global page comment subscribers
-        subscribers = PageSubscription.objects.filter(page=self.page, comment_notifications=True).select_related('user')
-        global_recipient_users = [subscriber.user for subscriber in subscribers if subscriber.user != self.request.user]
+        subscribers = PageSubscription.objects.filter(
+            page=self.page,
+            comment_notifications=True
+        ).exclude(
+            user=self.request.user
+        ).select_related('user')
+
+        global_recipients = [subscriber.user for subscriber in subscribers]
 
         # Get subscribers to individual threads
         replies = CommentReply.objects.filter(comment_id__in=relevant_comment_ids)
         comments = Comment.objects.filter(id__in=relevant_comment_ids)
-        thread_users = get_user_model().objects.exclude(pk=self.request.user.pk).exclude(pk__in=subscribers.values_list('user_id', flat=True)).prefetch_related(
+
+        # filter all users that left comment(s) on that page
+        q_comments = (
+            Q(**{('%s__isnull' % COMMENTS_RELATION_NAME): False})
+            & Q(**{('%s__page_id' % COMMENTS_RELATION_NAME): self.page.id})
+        )
+        # filter all users that replied to any comment on that page
+        q_replies = (
+            Q(comment_replies__isnull=False)
+            & Q(comment_replies__comment__page_id=self.page.id)
+        )
+        thread_users = get_user_model().objects.filter(
+            q_comments | q_replies
+        ).exclude(
+            pk=self.request.user.pk
+        ).exclude(
+            pk__in=subscribers.values_list('user_id', flat=True)
+        ).prefetch_related(
             Prefetch('comment_replies', queryset=replies),
             Prefetch(COMMENTS_RELATION_NAME, queryset=comments)
-        ).exclude(
-            Q(comment_replies__isnull=True) & Q(**{('%s__isnull' % COMMENTS_RELATION_NAME): True})
-        )
+        ).distinct()
 
         # Skip if no recipients
-        if not (global_recipient_users or thread_users):
+        if not (global_recipients or thread_users):
             return
-        thread_users = [(user, set(list(user.comment_replies.values_list('comment_id', flat=True)) + list(getattr(user, COMMENTS_RELATION_NAME).values_list('pk', flat=True)))) for user in thread_users]
+        thread_users = [
+            (user, set(
+                list(user.comment_replies.values_list('comment_id', flat=True))
+                + list(getattr(user, COMMENTS_RELATION_NAME).values_list('pk', flat=True))
+            )) for user in thread_users]
+
         mailed_users = set()
 
         for current_user, current_threads in thread_users:
@@ -180,7 +206,7 @@ class EditView(TemplateResponseMixin, ContextMixin, HookResponseMixin, View):
                 ]
             })
 
-        return send_notification(global_recipient_users, 'updated_comments', {
+        return send_notification(global_recipients, 'updated_comments', {
             'page': self.page,
             'editor': self.request.user,
             'new_comments': changes['new_comments'],
